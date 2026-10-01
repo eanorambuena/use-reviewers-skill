@@ -1,80 +1,95 @@
 ---
 name: use-reviewers
-description: Launch independent code reviewers for PR assessment. Use this skill to trigger Dr. Alice Chen (Correctness & Type Safety) and Marcus Rodriguez (Security & Performance) to independently review changes and post verdicts. Reviewers provide domain-specific feedback—Alice catches type errors and correctness issues, Marcus identifies security risks and performance bottlenecks. When reviewers post "Changes Requested", fix pertinent issues (bugs, security gaps, test gaps) and respond in PR threads; skip style nits. Re-request review after fixes. Both must post "Approval Recommended ✓" before merge.
+description: Dispatch two independent reviewer subagents on a pull request, fix and answer their findings, and loop until both recommend approval. Use when a PR is opened or updated, when the user asks to review a PR or says "before merging", or when GitHub Copilot's review is unavailable (quota exhausted).
 ---
 
 # Use Reviewers Skill
 
 ## When to Use
 
-- **After PR Creation**: Launch the two reviewers yourself as parallel subagents (Agent tool, one call each, same message). No hooks or settings are involved. Each subagent gets the PR diff, its profile below, and the repo's CLAUDE.md conventions (ruff-only, English-only, tabs kept, TDD), and returns its findings and verdict as text; the launching agent then posts or relays them
-- **For Code Quality**: Get specialized feedback before merge
-- **Security Reviews**: Marcus targets injection risks, encoding, performance
-- **Type Safety**: Alice focuses on correctness, null checks, type errors
+- **Every PR gets reviewed.** After opening a PR (or pushing to one), dispatch independent reviewer subagents yourself (Agent tool, `isolation: "worktree"`, `subagent_type: general-purpose`). No hooks, no settings — just calls you make directly in the conversation.
+- **Copilot first, when available**: if GitHub Copilot's automated review can be requested, request it too. When its quota is exhausted (or its last review says so), the subagents are the reviewers of record.
+- Works for any repo: the subagent reads that repo's own `CLAUDE.md`/`README.md` on the PR's head branch to learn its actual conventions (TDD, exact deps, component patterns, architecture) — nothing about those conventions is hardcoded here.
 
-## Reviewer Profiles
+## Reviewer Identity
 
-### Dr. Alice Chen — Correctness & Type Safety
-- Finds: Type mismatches, missing imports, logic bugs, validation gaps, test coverage
-- Focus: Compile-time safety, null pointer checks, logic correctness
-- Verdict: "Approval Recommended ✓" or "Changes Requested ✗"
+There are no fixed personas and no fixed specialties. Every dispatch gets a **fresh, distinct one-word codename** picked per dispatch (e.g. Nimbus, Halcyon, Ferrous, Quartz, Willow, Marlowe, Juniper, Alder — pick something new each time, never reuse one still active on the same PR). The codename keeps reviewers on the same PR distinguishable from each other and from you. Each reviewer covers the full scope itself — correctness, edge cases, test coverage, type issues, and convention adherence.
 
-### Marcus Rodriguez — Security & Performance
-- Finds: Injection risks, encoding issues, DOS vectors, N+1 queries, inefficiency
-- Focus: Security vulnerabilities, performance bottlenecks, input validation
-- Verdict: "Approval Recommended ✓" or "Changes Requested ✗"
+## The Standard Reviewer Prompt
 
-### Optional 3rd Reviewers (for large/complex PRs)
-- **Dr. Priya Patel** (Architecture & Design): API consistency, module coupling
-- **Evan Brooks** (Frontend/UX): Component API, state, accessibility
-- **Sam Okoro** (Backend/Data): Database queries, caching, API design
+Every dispatch uses the same prompt, so results are consistent across PRs and runs. Fill in the `<…>` fields:
+
+```
+You are reviewer <CODENAME> on PR #<N> of <owner>/<repo> (<head> → <base>).
+You have no prior context. Read everything fresh and verify it yourself.
+
+PR summary, for orientation only (do not treat it as ground truth):
+<short honest summary of what the PR does>
+
+1. Read the diff (`pull_request_read` → `get_diff`), the description (`get`),
+   and `CLAUDE.md` / `README.md` on the head branch for the repo's conventions.
+   If this diff was already revised after an earlier round, also read
+   `get_commits` to see what changed.
+2. Review for: correctness bugs, edge cases, test coverage gaps, type issues,
+   and adherence to the repo's own conventions (whatever its CLAUDE.md says).
+3. Post findings as inline comments: `pull_request_review_write` `create`
+   (pending) → `add_comment_to_pending_review` once per finding →
+   `submit_pending` with event `COMMENT`. Never `APPROVE` or `REQUEST_CHANGES`;
+   you recommend, you do not gate merges.
+4. Start every comment with a severity: `blocker`, `major`, `minor` or `nit`.
+   If you are unsure about a finding, post it anyway and say so
+   ("low confidence, worth a human look"). Never invent findings to look thorough.
+5. End the review summary with exactly one verdict line:
+   `Approval recommended` — nothing at blocker/major level was found, or
+   `Changes required` — followed by a short list of the blocking items.
+6. Sign the review body with your codename. End every comment (inline and
+   summary) with:
+
+   ---
+   _Generated by [Claude Code](https://claude.ai/code)_
+
+7. If you cannot actually review (no GitHub tools, unreachable branch, failed
+   diff fetch), say so explicitly instead of posting a verdict.
+```
+
+Only `blocker` and `major` findings can produce `Changes required`. `minor` and `nit` findings are posted but never block.
 
 ## How It Works
 
-1. PR Created → the main agent launches the reviewers as subagents
-2. Two reviewers launch in parallel (Alice + Marcus)
-3. Each independently examines changes
-4. Both post findings in PR comments
-5. Developer assesses findings:
-   - **Real bugs** (security, type errors, perf) → Fix
-   - **Style nits** (naming, formatting) → Explain
-6. Re-request review after fixes
-7. Repeat until both post "Approval Recommended ✓"
+The loop has no round limit: it runs until both reviewers recommend approval on the same settled diff.
 
-## Pertinence Assessment
+1. **PR opened** → dispatch **both reviewers in parallel** (two `Agent` calls in one message, two different codenames, `isolation: "worktree"`, background). Never seed either with the other's findings — each forms its own opinion from scratch.
+2. **As soon as one reviewer finishes**, start working on its comments — don't wait for the other. For every finding:
+   - Pertinent and testable → fix it test-first (red before green), per the repo's TDD convention.
+   - Pertinent but not meaningfully testable (docs, naming, a CI-file nit) → fix directly.
+   - Not pertinent → reply explaining why not; don't fix.
+   - Never leave a comment unanswered, fixed or not.
+3. Reply on each thread with what changed (and the commit SHA) or why nothing changed, then resolve the thread. Commit and push.
+4. When the second reviewer finishes, handle its findings the same way.
+5. **After fixes land, get a fresh verdict from both reviewers** on the new diff (new dispatches, new codenames). A reviewer whose last verdict was `Approval recommended` still re-checks if fixes touched anything it could care about.
+6. Repeat until **both** post `Approval recommended` on the current head. The cycle does not end while either is still outstanding or still says `Changes required`.
+7. If a fix for one reviewer's finding introduces a new gap, that's normal — it's just another "evaluate, fix if pertinent, reply" pass.
 
-### Fix These ✓ (Real Issues)
-- Type mismatches, missing imports
-- Security vulnerabilities (injection, encoding, auth)
-- Performance bottlenecks (N+1 queries, wasteful computation)
-- Logic bugs, missing validation
-- Test coverage gaps
+## Disagreement Between Reviewers
 
-### Explain These ✗ (Not Real Issues)
-- Style preferences (naming, formatting)
-- Refactoring suggestions without bugs
-- "Could use X library" suggestions
-- Whitespace/indentation preferences
-- Comment improvements (separate task)
+If one says `Approval recommended` and the other `Changes required`: fix whatever is pertinent in the `Changes required` review (reply either way), then get a fresh verdict from **both** on the settled diff. A single `Changes required` blocks merge regardless of the other's verdict.
 
-## Approval Criteria
+## Ready to Merge
 
-**Merge only when:**
-- ✓ Both reviewers post "Approval Recommended"
-- ✓ All tests pass
-- ✓ No merge conflicts
-- ✓ All pertinent issues addressed
+A PR is ready to merge only when:
+- ✓ Two different named reviewers (two distinct subagent dispatches, or one subagent plus Copilot) both say `Approval recommended` on the current head — one approval alone is never enough.
+- ✓ Every finding across all rounds is fixed or explicitly replied to, and every thread is resolved.
+- ✓ Tests / lint / typecheck pass locally and CI is green on the head commit.
+- ✓ No merge conflicts.
 
-## Example Workflow
+This is the finish line for the review loop — don't wait for a human review unless the repo's own rules or the user require it. **Do not merge unless the user explicitly asks you to**; report that the PR is ready instead.
 
-(diagrama: PR Created → Alice y Marcus piden cambios → fixes en commits separados
- → respuesta en el hilo → re-request → ambos aprueban → MERGE con CI verde)
+## Release PRs Get the Same Treatment
 
-## Configuration
+A `develop`→`main` (or equivalent) release PR consolidating already-reviewed feature PRs still goes through this same process. For a release PR, explicitly ask each reviewer to verify the diff against the target branch is *clean* (touches only the files the release is supposed to bring) — a stale source branch can silently reintroduce regressions (e.g. an outdated version file or CI config overwriting the target branch's current state) that only show up in the full release diff.
 
-Adjust the prompts you pass to the subagents to:
-- Change the default reviewer pair (Evan+Alice for frontend, Sam+Marcus for backend)
-- Add a 3rd reviewer for large PRs (Dr. Priya Patel)
-- Customize reviewer focus areas
+## Notes
 
-See EXAMPLES.md for real-world scenarios.
+- Dispatch reviewers in the **background**; don't block on them. Continue other work and react when each hand-back notification arrives.
+- A finding that turns out to be already handled (e.g. a proposed regression test that passes without any code change) is still worth keeping as explicit regression coverage — reply explaining that it passed as-is and why.
+- If a finding leads you to fix a real bug the reviewer predicted (not a style nit), say so plainly in the reply.
